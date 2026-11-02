@@ -462,6 +462,11 @@
     outline: none;
     border-color: var(--accent);
   }
+  textarea {
+    line-height: 20px;
+    min-height: 36px;
+    max-height: 160px;
+  }
   .bad {
     border-color: var(--err);
   }

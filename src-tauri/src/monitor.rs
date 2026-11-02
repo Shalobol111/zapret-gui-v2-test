@@ -143,7 +143,10 @@ pub fn compute(state: &AppState) -> Status {
     let tg_shared = state.tg.lock().unwrap().clone();
     let telegram = crate::tgproxy::status(&tg_shared);
     let app_update = state.self_update.lock().unwrap().clone();
-    let vpn = crate::vpn::status(&mut state.vpn.lock().unwrap(), &crate::vpn::load());
+    let mut vpn = crate::vpn::status(&mut state.vpn.lock().unwrap(), &crate::vpn::load());
+    if crate::vpn::operation::active() && vpn.busy.is_none() {
+        vpn.busy = Some("Применение настроек VPN".into());
+    }
     Status {
         zapret,
         bypass,

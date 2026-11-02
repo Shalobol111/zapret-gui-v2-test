@@ -15,6 +15,7 @@ export const app = $state({
   tests: null as TestRun | null,
   /** В «Списках» есть несохранённые правки — точка в меню и вопрос при закрытии окна. */
   listsDirty: false,
+  listTarget: null as string | null,
   /** Быстрый подбор запущен «Починить Discord» — он сам применит итог, тост TestsCard не нужен. */
   pickOwner: null as "discord" | "wizard" | null,
   /** Показать окно «Доступна новая версия» (клик по уведомлению или кнопка в Настройках). */
@@ -61,6 +62,11 @@ export function toggleTheme() {
 
 export function go(screen: Screen) {
   app.screen = screen;
+}
+
+export function openList(id: string) {
+  app.listTarget = id;
+  go("lists");
 }
 
 /** Подписки на события ядра; вызывается один раз при старте. */

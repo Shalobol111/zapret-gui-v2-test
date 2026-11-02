@@ -390,7 +390,13 @@ pub fn tests_last(state: State<AppState>) -> Option<Run> {
 
 #[tauri::command]
 pub async fn diag_run(app: AppHandle) -> Res<Vec<diagnostics::Item>> {
-    blocking(&app, |st| Ok(diagnostics::run(st.root().as_deref()))).await
+    blocking(&app, |st| {
+        let mut items = diagnostics::run(st.root().as_deref());
+        items.extend(crate::vpn::integration::diagnostics(st));
+        crate::vpn::integration::explain_owned_proxy(st, &mut items);
+        Ok(items)
+    })
+    .await
 }
 
 #[derive(Serialize)]
@@ -419,12 +425,22 @@ pub async fn diag_fix(app: AppHandle, fixes: Vec<diagnostics::Fix>) -> Res<Vec<F
 
 #[tauri::command]
 pub async fn lists_index(app: AppHandle) -> Res<Vec<userlists::ListInfo>> {
-    blocking(&app, |st| Ok(userlists::index(&st.require_root()?))).await
+    blocking(&app, |st| {
+        Ok(match st.require_root() {
+            Ok(root) => userlists::index(&root),
+            Err(_) => userlists::vpn_index(),
+        })
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn list_read(app: AppHandle, id: String) -> Res<userlists::ListData> {
-    blocking(&app, move |st| userlists::read(&st.require_root()?, &id)).await
+    blocking(&app, move |st| {
+        let root = if userlists::is_vpn(&id) { crate::vpn::dir() } else { st.require_root()? };
+        userlists::read(&root, &id)
+    })
+    .await
 }
 
 /// Ошибка "conflict" — файл изменили снаружи; интерфейс предложит перезаписать или перечитать.
@@ -437,7 +453,7 @@ pub async fn list_save(
     force: bool,
 ) -> Res<userlists::ListData> {
     blocking(&app, move |st| {
-        let root = st.require_root()?;
+        let root = if userlists::is_vpn(&id) { crate::vpn::dir() } else { st.require_root()? };
         match userlists::save(&root, &id, &text, &base_hash, force) {
             Ok(d) => {
                 journal::ok(format!("Сохранён список {}", d.info.file));
@@ -688,7 +704,8 @@ pub async fn site_check(app: AppHandle, input: String) -> Res<site::Report> {
         let root = st.require_root()?;
         let domain = site::normalize(&input)?;
         let bypass_on = monitor::compute(st).bypass.state == monitor::BypassState::On;
-        let report = site::check(&root, &domain, bypass_on)?;
+        let mut report = site::check(&root, &domain, bypass_on)?;
+        crate::vpn::integration::enrich_site(st, &root, &mut report);
         journal::info(format!("Мой сайт: {domain} — {}", report.verdict));
         Ok(report)
     })
@@ -703,6 +720,19 @@ pub async fn site_add(app: AppHandle, domain: String) -> Res<bool> {
         let added = site::add_to_user_list(&root, &domain)?;
         if added {
             journal::ok(format!("{domain} добавлен в «Свои домены»"));
+        }
+        Ok(added)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn site_add_vpn(app: AppHandle, domain: String) -> Res<bool> {
+    blocking(&app, move |_st| {
+        let domain = site::normalize(&domain)?;
+        let added = crate::vpn::lists::add_site(&domain)?;
+        if added {
+            journal::ok(format!("{domain} добавлен в личный VPN-список"));
         }
         Ok(added)
     })
@@ -1049,6 +1079,7 @@ fn vpn_busy(app: &AppHandle, busy: Option<&str>, progress: Option<u8>) {
 /// Работающий VPN перезапускается.
 #[tauri::command]
 pub async fn vpn_install(app: AppHandle) -> Res<String> {
+    let _operation = crate::vpn::operation::acquire()?;
     vpn_busy(&app, Some("Получение ссылок на релизы"), None);
     let r = async {
         let sb = crate::vpn::singbox::latest().await?;
@@ -1093,6 +1124,7 @@ pub async fn vpn_install(app: AppHandle) -> Res<String> {
 /// Подписка (https://…) или ключи (vless://, ss://…).
 #[tauri::command]
 pub async fn vpn_add(app: AppHandle, input: String) -> Res<VpnView> {
+    let _operation = crate::vpn::operation::acquire()?;
     vpn_busy(&app, Some("Загрузка подписки"), None);
     let r = crate::vpn::add(&input).await;
     vpn_busy(&app, None, None);
@@ -1103,6 +1135,7 @@ pub async fn vpn_add(app: AppHandle, input: String) -> Res<VpnView> {
 
 #[tauri::command]
 pub async fn vpn_update(app: AppHandle, id: Option<String>) -> Res<VpnView> {
+    let _operation = crate::vpn::operation::acquire()?;
     vpn_busy(&app, Some("Обновление подписки"), None);
     let r = crate::vpn::update(id.as_deref()).await;
     vpn_busy(&app, None, None);
@@ -1114,6 +1147,7 @@ pub async fn vpn_update(app: AppHandle, id: Option<String>) -> Res<VpnView> {
 /// Удалить подписку или сервер из одиночных ссылок.
 #[tauri::command]
 pub async fn vpn_remove(app: AppHandle, id: String) -> Res<VpnView> {
+    let _operation = crate::vpn::operation::acquire()?;
     blocking(&app, move |st| {
         let mut s = crate::vpn::load();
         s.subscriptions.retain(|x| x.id != id);
@@ -1130,6 +1164,7 @@ pub async fn vpn_remove(app: AppHandle, id: String) -> Res<VpnView> {
 /// Выбрать сервер (`None` — автоматически быстрейший); работающий VPN перезапускается.
 #[tauri::command]
 pub async fn vpn_select(app: AppHandle, id: Option<String>) -> Res<VpnView> {
+    let _operation = crate::vpn::operation::acquire()?;
     blocking(&app, move |st| {
         let mut s = crate::vpn::load();
         s.selected = id;
@@ -1145,27 +1180,38 @@ pub async fn vpn_select(app: AppHandle, id: Option<String>) -> Res<VpnView> {
 /// Настройки VPN (routeMode, inbound, presets, zapretDirect, port, autostart).
 #[tauri::command]
 pub async fn vpn_set(app: AppHandle, patch: Value) -> Res<VpnView> {
+    let _operation = crate::vpn::operation::acquire()?;
     blocking(&app, move |st| {
         let current = crate::vpn::load();
         let mut v = serde_json::to_value(&current).map_err(|e| e.to_string())?;
         if let (Some(obj), Value::Object(p)) = (v.as_object_mut(), patch) {
             for (k, val) in p {
-                if matches!(k.as_str(), "routeMode" | "inbound" | "presets" | "zapretDirect" | "port" | "autostart") {
+                if matches!(
+                    k.as_str(),
+                    "routeMode" | "inbound" | "presets" | "zapretDirect" | "port" | "autostart" | "systemStack"
+                ) {
                     obj.insert(k, val);
                 }
             }
         }
-        let next: crate::vpn::Store = serde_json::from_value(v).map_err(|e| format!("неверные настройки VPN: {e}"))?;
+        let mut next: crate::vpn::Store =
+            serde_json::from_value(v).map_err(|e| format!("неверные настройки VPN: {e}"))?;
         if next.port < 1024 {
             return Err("порт должен быть от 1024 до 65535".into());
         }
-        crate::vpn::save(&next)?;
         let restart = st.vpn.lock().unwrap().child.is_some()
             && (next.route_mode != current.route_mode
                 || next.inbound != current.inbound
                 || next.presets != current.presets
                 || next.zapret_direct != current.zapret_direct
+                || next.system_stack != current.system_stack
                 || next.port != current.port);
+        // Прежний порт нужен восстановлению прокси. Не записываем новый до остановки.
+        if restart {
+            crate::vpn::stop(st)?;
+            next.saved_proxy = crate::vpn::load().saved_proxy;
+        }
+        crate::vpn::save(&next)?;
         if restart {
             crate::vpn::start(st)?;
         }
@@ -1176,6 +1222,7 @@ pub async fn vpn_set(app: AppHandle, patch: Value) -> Res<VpnView> {
 
 #[tauri::command]
 pub async fn vpn_start(app: AppHandle) -> Res<()> {
+    let _operation = crate::vpn::operation::acquire()?;
     // Серверы, сохранённые до появления Xray, не помнят исходных ссылок — обновляем подписки.
     if crate::vpn::load().subscriptions.iter().any(|sub| sub.servers.iter().any(|sv| sv.link.is_none())) {
         vpn_busy(&app, Some("Обновление подписки"), None);
@@ -1185,9 +1232,12 @@ pub async fn vpn_start(app: AppHandle) -> Res<()> {
     }
     vpn_busy(&app, Some("Подготовка списков"), None);
     let store = crate::vpn::load();
-    let mut need: Vec<&crate::vpn::lists::Preset> =
-        store.presets.iter().filter_map(|id| crate::vpn::lists::preset(id)).collect();
-    need.push(&crate::vpn::lists::RU_DIRECT);
+    // Основной список редактируется пользователем и больше не обновляется неявно.
+    let need = if store.route_mode == crate::vpn::RouteMode::AllExceptRu {
+        vec![&crate::vpn::lists::RU_DIRECT]
+    } else {
+        vec![]
+    };
     let errors = crate::vpn::lists::refresh(&need, false).await;
     for e in errors {
         journal::warn(format!("VPN: список не обновился ({e}) — используется сохранённый"));
@@ -1208,6 +1258,7 @@ pub async fn vpn_start(app: AppHandle) -> Res<()> {
 
 #[tauri::command]
 pub async fn vpn_stop(app: AppHandle) -> Res<()> {
+    let _operation = crate::vpn::operation::acquire()?;
     blocking(&app, |st| {
         st.vpn.lock().unwrap().error = None;
         crate::vpn::stop(st)
@@ -1215,13 +1266,18 @@ pub async fn vpn_stop(app: AppHandle) -> Res<()> {
     .await
 }
 
-/// Задержка до серверов (TCP); результат сохраняется для списка серверов.
+/// HTTPS через каждый профиль в отдельных процессах, без смены рабочего VPN.
 #[tauri::command]
 pub async fn vpn_ping(app: AppHandle) -> Res<std::collections::HashMap<String, Option<u32>>> {
     blocking(&app, |st| {
-        let pings = crate::vpn::ping(&crate::vpn::load());
+        let pings = crate::vpn::probe::run(&crate::vpn::load())?;
         st.vpn.lock().unwrap().pings = pings.clone();
         Ok(pings)
     })
     .await
+}
+
+#[tauri::command]
+pub async fn vpn_routes() -> Res<String> {
+    crate::vpn::routes::snapshot().await
 }

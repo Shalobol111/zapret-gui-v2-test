@@ -157,6 +157,7 @@ export interface VpnSubscription {
 }
 
 export interface VpnStore {
+  systemStack?: boolean;
   subscriptions: VpnSubscription[];
   manual: VpnServer[];
   selected: string | null;
@@ -324,7 +325,7 @@ export interface Fakes {
   game: string | null;
 }
 // ── «Мой сайт» (zapret/site.rs) ────────────────────────────────
-export type SiteAction = "add_to_list" | "pick" | "enable_bypass" | "secure_dns" | "open_exclude" | "compare";
+export type SiteAction = "add_to_list" | "add_to_vpn" | "open_vpn" | "pick" | "enable_bypass" | "secure_dns" | "open_exclude" | "compare";
 
 export interface SiteItem {
   id: string;

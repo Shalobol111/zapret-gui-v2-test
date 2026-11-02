@@ -1,10 +1,11 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import Button from "../components/Button.svelte";
   import ListEditor from "../components/ListEditor.svelte";
   import PageHeader from "../components/PageHeader.svelte";
   import * as api from "../lib/api";
   import { parsePaste, stats } from "../lib/lists";
-  import { offerRestart } from "../lib/restart";
+  import { offerRestart, offerVpnRestart } from "../lib/restart";
   import { app, go } from "../lib/state.svelte";
   import { askDialog, plural, toast } from "../lib/ui.svelte";
   import type { ListData, ListInfo } from "../lib/types";
@@ -15,8 +16,14 @@
   let editor = $state<ReturnType<typeof ListEditor>>();
   let saving = $state(false);
   let loading = $state(false);
+  $effect(() => {
+    const instance = editor;
+    if (instance) untrack(() => instance.load(text));
+  });
 
   const valid = $derived(!!app.status?.zapret.valid);
+  const vpnList = $derived(current?.id.startsWith("vpn_") ?? false);
+  const editable = $derived(!!current && (valid || vpnList));
   const dirty = $derived(!!current && text !== current.text);
   $effect(() => {
     app.listsDirty = dirty;
@@ -34,26 +41,33 @@
 
   // Папка zapret или режим IPSet поменялись — перечитываем список файлов.
   // $derived со строкой срабатывает только при реальной смене, а не на каждый статус.
-  const indexKey = $derived(valid ? `${app.status?.zapret.path}|${app.status?.filters?.ipset}` : "");
+  const indexKey = $derived(valid ? `${app.status?.zapret.path}|${app.status?.filters?.ipset}` : "vpn-only");
+  let indexVersion = 0;
   $effect(() => {
-    if (!indexKey) {
-      index = [];
-      current = null;
-      text = "";
-      return;
-    }
+    void indexKey;
+    if (!app.ready) return;
+    const version = ++indexVersion;
     api.listsIndex().then((list) => {
+      if (version !== indexVersion) return;
       index = list;
-      if (!current) open(list[0].id, true);
-      else {
+      if (!current && !app.listTarget && list.length) open(list[0].id, true);
+      else if (current) {
         const same = list.find((l) => l.id === current!.id);
         // IPSet переключили, а правок нет — открываем актуальный файл.
         if (same && same.file !== current.file && !dirty) open(same.id, true);
       }
-    });
+    }).catch((e) => toast(api.errorText(e), "err"));
+  });
+
+  $effect(() => {
+    const target = app.listTarget;
+    if (app.screen !== "lists" || !target || loading || !index.some((l) => l.id === target)) return;
+    app.listTarget = null;
+    open(target);
   });
 
   async function open(id: string, force = false) {
+    if (loading || saving) return;
     if (!force && current?.id === id) return;
     if (!force && dirty) {
       const r = await askDialog({
@@ -79,18 +93,20 @@
   }
 
   async function save(force = false): Promise<boolean> {
-    if (!current || saving) return false;
+    if (!current || !editable || saving || loading) return false;
     if (!dirty && !force) return true;
     saving = true;
     try {
-      const d = await api.listSave(current.id, text, current.hash, force);
+      const sentText = text;
+      const d = await api.listSave(current.id, sentText, current.hash, force);
       current = d;
       // Ядро могло дополнить текст (например, «domain.example.abc» в пустой список).
-      if (d.text !== text) {
+      if (text === sentText && d.text !== text) {
         text = d.text;
         editor?.replace(d.text);
       }
-      offerRestart(`Сохранено: ${d.file}`);
+      if (vpnList) offerVpnRestart(`Сохранено: ${d.file}`);
+      else offerRestart(`Сохранено: ${d.file}`);
       return true;
     } catch (e) {
       if (api.errorText(e) === "conflict") {
@@ -145,8 +161,9 @@
   }
 
   const groups = $derived([
-    { title: "Домены", items: index.filter((l) => l.kind === "domains") },
+    { title: "Домены zapret", items: index.filter((l) => l.kind === "domains" && !l.id.startsWith("vpn_")) },
     { title: "IP-адреса", items: index.filter((l) => l.kind === "ips") },
+    { title: "VPN", items: index.filter((l) => l.id.startsWith("vpn_")) },
   ]);
   const unit = $derived(
     (current?.kind === "ips" ? ["адрес", "адреса", "адресов"] : ["домен", "домена", "доменов"]) as [string, string, string],
@@ -156,31 +173,33 @@
 <svelte:window onkeydown={onKey} />
 
 <PageHeader title="Списки">
-  <span class="status">Изменения применяются после перезапуска стратегии</span>
+  <span class="status">{vpnList ? "Изменения применяются после перезапуска VPN" : "Изменения применяются после перезапуска стратегии"}</span>
 </PageHeader>
 
 <div class="body">
   <section class="files" aria-label="Файлы">
     {#each groups as g (g.title)}
+      {#if g.items.length}
       <span class="group">{g.title}</span>
       {#each g.items as it (it.id)}
-        <button type="button" class="file" class:active={current?.id === it.id} aria-current={current?.id === it.id} onclick={() => open(it.id)}>
+        <button type="button" class="file" class:active={current?.id === it.id} disabled={loading || saving} aria-current={current?.id === it.id} onclick={() => open(it.id)}>
           <span class="ftitle">{it.title}{#if current?.id === it.id && dirty}<span class="fdirty" aria-label="изменён"></span>{/if}</span>
           <span class="fname">{it.file}</span>
         </button>
       {/each}
+      {/if}
     {/each}
   </section>
 
   <section class="editor-card" aria-label="Редактор">
-    {#if valid}
+    {#if editable}
       <div class="head">
         <span class="name" title={current?.file}>{current?.file ?? "…"}</span>
         {#if dirty}<span class="changed">● изменён</span>{/if}
         <span class="grow"></span>
-        <Button height={32} size={12} disabled={!current || loading} onclick={paste}><span class="long">Вставить из буфера</span><span class="short">Вставить</span></Button>
-        <Button height={32} size={12} disabled={!dirty} onclick={revert}>Отменить</Button>
-        <Button variant="primary" height={32} size={12} disabled={!dirty || saving} onclick={() => save()}
+        <Button height={32} size={12} disabled={!current || loading || saving} onclick={paste}><span class="long">Вставить из буфера</span><span class="short">Вставить</span></Button>
+        <Button height={32} size={12} disabled={!dirty || saving || loading} onclick={revert}>Отменить</Button>
+        <Button variant="primary" height={32} size={12} disabled={!dirty || saving || loading} onclick={() => save()}
           >{saving ? "Сохранение…" : "Сохранить"}</Button
         >
       </div>
@@ -336,7 +355,7 @@
     display: none;
   }
   /* Узкий редактор (окно 780–900 px): короче подпись кнопки, без пометки кодировки. */
-  @container (max-width: 440px) {
+  @container (max-width: 600px) {
     .long,
     .enc {
       display: none;

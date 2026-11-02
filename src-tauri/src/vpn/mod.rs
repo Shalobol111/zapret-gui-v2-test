@@ -2,11 +2,17 @@
 //! остальное напрямую (там работает zapret). Подписки и ключи, маршрутизация, системный прокси или TUN.
 
 pub mod config;
+pub mod integration;
 pub mod links;
 pub mod lists;
+pub mod operation;
+pub mod probe;
+pub mod routes;
 pub mod singbox;
 pub mod subscription;
 pub mod sysproxy;
+pub mod tun;
+pub mod voice;
 pub mod xray;
 
 use std::collections::HashMap;
@@ -67,12 +73,14 @@ pub struct Store {
     pub selected: Option<String>,
     pub route_mode: RouteMode,
     pub inbound: Inbound,
+    /// Старое поле сохранено для совместимости настроек. Наборы заменены GENERAL_FILE.
     pub presets: Vec<String>,
     /// Сайты из списков zapret — напрямую через zapret.
     pub zapret_direct: bool,
     pub port: u16,
     /// Включать VPN при запуске ZapretGUI.
     pub autostart: bool,
+    pub system_stack: bool,
     /// Системный прокси до нашего включения (пока он наш) — вернуть после остановки или сбоя.
     pub saved_proxy: Option<sysproxy::Saved>,
 }
@@ -89,6 +97,7 @@ impl Default for Store {
             zapret_direct: true,
             port: 2080,
             autostart: false,
+            system_stack: false,
             saved_proxy: None,
         }
     }
@@ -116,7 +125,10 @@ pub fn load() -> Store {
 pub fn save(s: &Store) -> Result<(), String> {
     fs::create_dir_all(dir()).map_err(|e| e.to_string())?;
     let text = serde_json::to_string_pretty(s).map_err(|e| e.to_string())?;
-    fs::write(store_file(), text).map_err(|e| format!("не удалось сохранить настройки VPN: {e}"))
+    let temp = store_file().with_extension("json.tmp");
+    fs::write(&temp, text)
+        .and_then(|_| fs::rename(&temp, store_file()))
+        .map_err(|e| format!("не удалось сохранить настройки VPN: {e}"))
 }
 
 pub fn servers(s: &Store) -> Vec<&Server> {
@@ -128,6 +140,7 @@ pub fn servers(s: &Store) -> Vec<&Server> {
 /// Что меняется не из файлов: процесс, действие, задержки серверов.
 #[derive(Default)]
 pub struct Runtime {
+    pub voice_auto: bool,
     pub child: Option<Child>,
     /// Xray — если выбранные серверы работают через него.
     pub xray: Option<Child>,
@@ -200,7 +213,11 @@ pub fn status(rt: &mut Runtime, store: &Store) -> Status {
         version: singbox::version(),
         latest: rt.latest.clone(),
         running: alive,
-        ready: alive && (store.inbound == Inbound::Tun || listening(store.port)),
+        ready: alive
+            && match store.inbound {
+                Inbound::Tun => tun::ready(),
+                Inbound::Proxy => listening(store.port),
+            },
         inbound: alive.then_some(store.inbound),
         route_mode: alive.then_some(store.route_mode),
         server: alive.then(|| rt.server_name.clone()).flatten(),
@@ -288,6 +305,7 @@ pub fn xray_log_file() -> PathBuf {
 /// и признак «нужен Xray».
 pub fn write_config(store: &Store, zapret_root: Option<&Path>) -> Result<(String, bool), String> {
     lists::ensure_custom();
+    lists::ensure_general()?;
     fs::create_dir_all(dir()).map_err(|e| e.to_string())?;
     let (engine, name) = chosen(store)?;
     let (servers, use_xray) = match engine {
@@ -313,11 +331,16 @@ pub fn write_config(store: &Store, zapret_root: Option<&Path>) -> Result<(String
         vpn_custom: lists::custom(lists::VPN_FILE),
         direct_custom: lists::custom(lists::DIRECT_FILE),
         zapret_direct: if store.zapret_direct { lists::zapret_domains(zapret_root) } else { vec![] },
-        vpn_presets: store.presets.iter().filter_map(|id| lists::preset(id)).flat_map(lists::domains).collect(),
+        vpn_presets: lists::custom(lists::GENERAL_FILE),
         ru_direct: lists::domains(&lists::RU_DIRECT),
         log_file: log_file().display().to_string(),
     };
-    let cfg = config::build(&input);
+    let mut cfg = config::build(&input);
+
+    if store.inbound == Inbound::Tun && store.system_stack {
+        cfg["inbounds"][0]["stack"] = serde_json::json!("system");
+    }
+    routes::configure(&mut cfg)?;
     fs::write(config_file(), serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?)
         .map_err(|e| format!("не удалось записать конфиг: {e}"))?;
     singbox::check(&config_file()).map_err(|e| format!("sing-box не принял настройки: {e}"))?;
@@ -402,6 +425,9 @@ pub fn start(st: &AppState) -> Result<(), String> {
     let mut store = load();
     let root = st.root();
     let (name, use_xray) = write_config(&store, root.as_deref())?;
+    if store.inbound == Inbound::Tun && tun::ready() {
+        return Err("адаптер ZapretGUI уже используется — дождитесь остановки предыдущего TUN-подключения".into());
+    }
     if let Some(r) = root.as_deref() {
         match exclude_from_zapret(r, &store) {
             Ok(n) if n > 0 => journal::info(format!("VPN: адреса серверов ({n}) добавлены в исключения zapret")),
@@ -456,7 +482,7 @@ pub fn start(st: &AppState) -> Result<(), String> {
         }
         let ok = match store.inbound {
             Inbound::Proxy => listening(store.port),
-            Inbound::Tun => t0.elapsed() > Duration::from_millis(2500),
+            Inbound::Tun => tun::ready(),
         };
         if ok {
             break;
@@ -464,27 +490,34 @@ pub fn start(st: &AppState) -> Result<(), String> {
         if t0.elapsed() > Duration::from_secs(10) {
             let _ = child.kill();
             kill_xray(&mut xray_child);
-            return Err("sing-box не начал работу за 10 с".into());
+            return Err(match store.inbound {
+                Inbound::Tun => "адаптер TUN не перешёл в рабочее состояние за 10 с".into(),
+                Inbound::Proxy => "sing-box не начал работу за 10 с".into(),
+            });
         }
         std::thread::sleep(Duration::from_millis(200));
     }
     if store.inbound == Inbound::Proxy {
-        match sysproxy::enable(store.port) {
-            Ok(before) => {
-                if !sysproxy_is_ours(&before, store.port) {
-                    store.saved_proxy = Some(before);
-                }
-                save(&store)?;
-            }
-            Err(e) => {
-                let _ = child.kill();
-                kill_xray(&mut xray_child);
-                return Err(e);
-            }
+        // Сохраняем прежнее состояние ДО изменения Windows: при сбое записи прокси ещё не включён.
+        let before = sysproxy::current();
+        if !sysproxy_is_ours(&before, store.port) {
+            store.saved_proxy = Some(before);
+        }
+        if let Err(e) = save(&store).and_then(|_| sysproxy::enable(store.port).map(|_| ())) {
+            let _ = child.kill();
+            let _ = child.wait();
+            kill_xray(&mut xray_child);
+            restore_proxy();
+            return Err(e);
         }
     }
     let mut rt = st.vpn.lock().unwrap();
     rt.child = Some(child);
+    rt.voice_auto = store.inbound == Inbound::Tun
+        && store.zapret_direct
+        && lists::zapret_domains(root.as_deref())
+            .iter()
+            .any(|d| matches!(d.trim_start_matches('.'), "discord.com" | "discord.media"));
     rt.xray = xray_child;
     rt.started_at = Some(crate::zapret::runner::now_ms());
     rt.error = None;
@@ -507,6 +540,8 @@ fn sysproxy_is_ours(saved: &sysproxy::Saved, port: u16) -> bool {
 pub fn stop(st: &AppState) -> Result<(), String> {
     let (child, xchild) = {
         let mut rt = st.vpn.lock().unwrap();
+        rt.voice_auto = false;
+        voice::clear();
         (rt.child.take(), rt.xray.take())
     };
     let was = child.is_some();
@@ -529,10 +564,12 @@ pub fn stop(st: &AppState) -> Result<(), String> {
 /// Вернуть системный прокси, если он остался нашим (остановка, сбой, прошлый запуск).
 pub fn restore_proxy() {
     let mut store = load();
-    if let Some(saved) = store.saved_proxy.take() {
-        if let Err(e) = sysproxy::restore(&saved, store.port) {
+    if let Some(saved) = store.saved_proxy.as_ref() {
+        if let Err(e) = sysproxy::restore(saved, store.port) {
             journal::warn(format!("VPN: не удалось вернуть системный прокси: {e}"));
+            return;
         }
+        store.saved_proxy = None;
         let _ = save(&store);
     } else if sysproxy::is_ours(store.port) {
         let _ = sysproxy::restore(&sysproxy::Saved::default(), store.port);
@@ -646,29 +683,6 @@ pub async fn update(id: Option<&str>) -> Result<usize, String> {
     }
 }
 
-/// Задержка до серверов: время TCP-подключения (для QUIC-протоколов — недоступно).
-pub fn ping(store: &Store) -> HashMap<String, Option<u32>> {
-    let list: Vec<(String, String, u16)> =
-        servers(store).iter().map(|s| (s.id.clone(), s.host.clone(), s.port)).collect();
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = list
-            .iter()
-            .map(|(id, host, port)| {
-                scope.spawn(move || {
-                    let t0 = Instant::now();
-                    let ok = (host.as_str(), *port)
-                        .to_socket_addrs()
-                        .ok()
-                        .and_then(|mut a| a.next())
-                        .is_some_and(|addr| TcpStream::connect_timeout(&addr, Duration::from_secs(3)).is_ok());
-                    (id.clone(), ok.then(|| t0.elapsed().as_millis() as u32))
-                })
-            })
-            .collect();
-        handles.into_iter().filter_map(|h| h.join().ok()).collect()
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,6 +715,35 @@ hy2://pw@h.com:8443?sni=h.com#H",
         assert_eq!(s.port, 2080);
         assert!(s.zapret_direct);
         assert_eq!(s.presets, vec!["blocked", "ai"]);
+    }
+
+    /// Проверка генератора установленным ядром, без подключения и подписок.
+    /// В изолированную папку ZAPRETGUI_DATA_DIR заранее копируется vpn/core/sing-box.exe.
+    #[test]
+    #[ignore]
+    fn live_config_matrix() {
+        assert!(std::env::var_os("ZAPRETGUI_DATA_DIR").is_some());
+        assert!(singbox::installed());
+        fs::create_dir_all(dir()).unwrap();
+        for inbound in [Inbound::Proxy, Inbound::Tun] {
+            for mode in [RouteMode::Lists, RouteMode::AllExceptRu] {
+                let input = config::Input {
+                    inbound,
+                    route_mode: mode,
+                    port: 22080,
+                    servers: vec![serde_json::json!({"type":"socks", "server":"127.0.0.1", "server_port":22081})],
+                    vpn_custom: vec!["vpn.example".into()],
+                    direct_custom: vec!["direct.example".into()],
+                    zapret_direct: vec!["youtube.com".into()],
+                    vpn_presets: vec!["vpn.example".into(), "direct.example".into()],
+                    ru_direct: vec!["ru".into()],
+                    log_file: log_file().display().to_string(),
+                };
+                let path = dir().join("matrix-check.json");
+                fs::write(&path, serde_json::to_vec(&config::build(&input)).unwrap()).unwrap();
+                singbox::check(&path).unwrap_or_else(|e| panic!("{inbound:?}/{mode:?}: {e}"));
+            }
+        }
     }
 
     /// Настоящий sing-box: скачивание, проверка конфига во всех режимах и маршрутизация в режиме

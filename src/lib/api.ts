@@ -115,6 +115,7 @@ export const diagFix = (fixes: FixId[]) => call<FixResult[]>("diag_fix", { fixes
 // ── «Мой сайт» ─────────────────────────────────────────────────
 export const siteCheck = (input: string) => call<SiteReport>("site_check", { input });
 export const siteAdd = (domain: string) => call<boolean>("site_add", { domain });
+export const siteAddVpn = (domain: string) => call<boolean>("site_add_vpn", { domain });
 export const siteCompare = (domain: string) => call<SiteProbe>("site_compare", { domain });
 export const testsSite = (domain: string, stopService: boolean) => call<void>("tests_site", { domain, stopService });
 
@@ -162,6 +163,7 @@ export const vpnSet = (patch: Partial<VpnStore>) => call<VpnView>("vpn_set", { p
 export const vpnStart = () => call<void>("vpn_start");
 export const vpnStop = () => call<void>("vpn_stop");
 export const vpnPing = () => call<Record<string, number | null>>("vpn_ping");
+export const vpnRoutes = () => call<string>("vpn_routes");
 
 // ── Списки ─────────────────────────────────────────────────────
 export const listsIndex = () => call<ListInfo[]>("lists_index");

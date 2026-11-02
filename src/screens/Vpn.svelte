@@ -1,13 +1,18 @@
 <script lang="ts">
   // VPN вместе с zapret (PLAN.md §17): сайты из VPN-списков — через VPN-сервер (sing-box),
   // остальное напрямую, где работает zapret. Карточка состояния — как на Главной.
+  import { slide } from "svelte/transition";
+  import { cubicInOut } from "svelte/easing";
+  import { onMount, tick } from "svelte";
+  import Spinner from "../components/Spinner.svelte";
+  import AutoHeight from "../components/AutoHeight.svelte";
   import Button from "../components/Button.svelte";
   import PageHeader from "../components/PageHeader.svelte";
   import PowerButton from "../components/PowerButton.svelte";
   import Segmented from "../components/Segmented.svelte";
   import Switch from "../components/Switch.svelte";
   import * as api from "../lib/api";
-  import { app } from "../lib/state.svelte";
+  import { app, openList } from "../lib/state.svelte";
   import { duration, toast } from "../lib/ui.svelte";
   import type { VpnInbound, VpnRouteMode, VpnServer, VpnStore, VpnView } from "../lib/types";
 
@@ -18,7 +23,40 @@
   const running = $derived(!!vs?.running);
 
   let view = $state<VpnView | null>(null);
+  let routes = $state("");
+  let readingRoutes = $state(false);
+  async function readRoutes() {
+    if (readingRoutes) return;
+    readingRoutes = true;
+    try { routes = await api.vpnRoutes(); } catch (e) { fail(e); }
+    finally { readingRoutes = false; }
+  }
+  let pendingInbound = $state<VpnInbound | null>(null);
+  let advancedOpen = $state(false);
+  let reducedMotion = $state(false);
+  const motionDuration = $derived(reducedMotion ? 0 : 180);
   const store = $derived(view?.store);
+  const inbound = $derived(pendingInbound ?? store?.inbound ?? "proxy");
+  const routeRows = $derived(routes.split("\n").filter(Boolean).map((line) => {
+    const [route, ...parts] = line.split(" | ");
+    return { route: parts.length ? route : "", text: parts.length ? parts.join(" · ") : line };
+  }));
+  onMount(() => {
+    const media = matchMedia("(prefers-reduced-motion: reduce)");
+    const updateMotion = () => { reducedMotion = media.matches; };
+    updateMotion();
+    media.addEventListener("change", updateMotion);
+    return () => media.removeEventListener("change", updateMotion);
+  });
+  async function changeInbound(next: VpnInbound) {
+    if (busy || !store || next === inbound) return;
+    busy = "set";
+    pendingInbound = next;
+    await tick();
+    try { view = await api.vpnSet({ inbound: next }); }
+    catch (e) { await load(); fail(e); }
+    finally { pendingInbound = null; busy = null; }
+  }
   async function load() {
     try {
       view = await api.vpnView();
@@ -71,13 +109,8 @@
     run("ping", async () => {
       const pings = await api.vpnPing();
       if (view) view.pings = pings;
+      toast(`HTTPS-проверка: доступно ${Object.values(pings).filter((v) => v !== null).length} из ${Object.keys(pings).length} серверов`, "info");
     });
-
-  function togglePreset(id: string, on: boolean) {
-    if (!store) return;
-    const next = on ? [...new Set([...store.presets, id])] : store.presets.filter((p) => p !== id);
-    set({ presets: next });
-  }
 
   // ── Тексты ───────────────────────────────────────────────────
   const allServers = $derived<VpnServer[]>(
@@ -123,7 +156,7 @@
   }
   const pingText = (id: string) => {
     const p = view?.pings[id];
-    return p === undefined ? "" : p === null ? "недоступен" : `${p} мс`;
+    return p === undefined ? "" : p === null ? "проверка не пройдена" : `${p} мс · HTTPS`;
   };
 </script>
 
@@ -142,7 +175,7 @@
 <section class="card state" aria-label="Состояние VPN">
   <PowerButton
     on={running}
-    busy={busy === "power" || (running && !vs?.ready) || !!vs?.busy}
+    busy={busy === "power" || !!vs?.busy}
     disabled={!installed || !usable.length || !!busy || !app.isAdmin}
     title={!app.isAdmin ? "Нужны права администратора" : !installed ? "Сначала скачайте ядра VPN" : !usable.length ? "Добавьте подписку или ключ" : undefined}
     onclick={toggle}
@@ -171,7 +204,7 @@
   <div class="card-head">
     <h2 id="vpn-srv">Серверы</h2>
     {#if allServers.length}
-      <Button height={30} size={12} disabled={!!busy} onclick={ping}>{busy === "ping" ? "Проверка…" : "Проверить задержку"}</Button>
+      <Button height={30} size={12} disabled={!!busy} onclick={ping}>{busy === "ping" ? "Проверка…" : "Проверить подключение"}</Button>
     {/if}
   </div>
   <form
@@ -258,21 +291,7 @@
     {#if store?.routeMode === "all_except_ru"}
       <p class="hint">Российские сайты (.ru, .рф, сервисы, не пускающие из-за границы) — напрямую, всё остальное — через VPN.</p>
     {:else}
-      <p class="hint">Через VPN — только сайты из отмеченных наборов и своего списка, остальное — напрямую.</p>
-      {#each view?.presets ?? [] as p (p.id)}
-        <label class="opt">
-          <input
-            type="checkbox"
-            checked={store?.presets.includes(p.id)}
-            disabled={!!busy}
-            onchange={(e) => togglePreset(p.id, e.currentTarget.checked)}
-          />
-          <span>
-            <span class="label">{p.title}</span>
-            {#if p.hint || p.count}<span class="hint">{p.hint}{p.hint && p.count ? " · " : ""}{p.count ? `${p.count} доменов` : ""}</span>{/if}
-          </span>
-        </label>
-      {/each}
+      <p class="hint">Через VPN — сайты из list-vpn-general и своего списка, остальное — напрямую. Изменить домены можно в разделе «Списки».</p>
     {/if}
     <div class="line">
       <div class="text">
@@ -282,42 +301,47 @@
       <Switch label="Сайты zapret — напрямую" checked={!!store?.zapretDirect} disabled={!store || !!busy} onchange={(v) => set({ zapretDirect: v })} />
     </div>
     <div class="links">
-      <button type="button" class="link" onclick={() => api.openPath("vpnlist-vpn").catch(fail)}>Свой список «через VPN»</button>
-      <button type="button" class="link" onclick={() => api.openPath("vpnlist-direct").catch(fail)}>«Всегда напрямую»</button>
+      <button type="button" class="link" onclick={() => openList("vpn_general")}>list-vpn-general</button>
+      <button type="button" class="link" onclick={() => openList("vpn_domains")}>Свой список «через VPN»</button>
+      <button type="button" class="link" onclick={() => openList("vpn_direct")}>«Всегда напрямую»</button>
     </div>
   </section>
 
   <section class="card small" aria-labelledby="vpn-conn">
     <h2 id="vpn-conn">Подключение</h2>
-    <Segmented
-      label="Какие программы"
-      value={store?.inbound ?? "proxy"}
-      disabled={!store || !!busy}
-      options={[
-        { value: "proxy", label: "Системный прокси" },
-        { value: "tun", label: "Все программы (TUN)" },
-      ]}
-      onchange={(v) => set({ inbound: v })}
-    />
-    <p class="hint">
-      {store?.inbound === "tun"
+    <div class="mode-row" aria-busy={pendingInbound !== null}>
+      <Segmented
+        label="Какие программы"
+        value={inbound}
+        animated
+        disabled={!store || !!busy}
+        options={[
+          { value: "proxy", label: "Системный прокси" },
+          { value: "tun", label: "Все программы (TUN)" },
+        ]}
+        onchange={changeInbound}
+      />
+      <span class="mode-progress" role="status" aria-label={pendingInbound ? "Переключение режима подключения" : undefined}>
+        {#if pendingInbound}<Spinner size={16} />{/if}
+      </span>
+    </div>
+    <AutoHeight><p class="hint">
+      {inbound === "tun"
         ? "Весь трафик всех программ, включая Discord и игры. Экспериментально: проверьте, что zapret и VPN работают вместе."
         : "Браузеры и программы, которые используют прокси Windows. Без драйвера; при выключении прокси возвращается как было."}
-    </p>
-    {#if store?.inbound !== "tun"}
-      <div class="line">
-        <span class="label">Порт прокси</span>
-        <input
-          class="mono port"
-          inputmode="numeric"
-          value={store?.port ?? 2080}
-          disabled={!store || !!busy}
-          onchange={(e) => {
-            const n = Number(e.currentTarget.value);
-            if (Number.isInteger(n) && n >= 1024 && n <= 65535) set({ port: n });
-            else toast("Порт — число от 1024 до 65535", "err");
-          }}
-        />
+    </p></AutoHeight>
+    {#if inbound !== "tun"}
+      <div transition:slide={{ duration: motionDuration, easing: cubicInOut }}>
+        <div class="line">
+          <span class="label">Порт прокси</span>
+          <input class="mono port" inputmode="numeric" aria-label="Порт прокси"
+            value={store?.port ?? 2080} disabled={!store || !!busy}
+            onchange={(e) => {
+              const n = Number(e.currentTarget.value);
+              if (Number.isInteger(n) && n >= 1024 && n <= 65535) set({ port: n });
+              else toast("Порт — число от 1024 до 65535", "err");
+            }} />
+        </div>
       </div>
     {/if}
     <div class="line">
@@ -326,13 +350,79 @@
       </div>
       <Switch label="Включать вместе с ZapretGUI" checked={!!store?.autostart} disabled={!store || !!busy} onchange={(v) => set({ autostart: v })} />
     </div>
-    <div class="links">
-      <button type="button" class="link" onclick={() => api.openPath("vpnlog").catch(fail)}>Лог sing-box</button>
-    </div>
   </section>
 </div>
 
+<section class="card advanced" aria-label="Расширенные параметры VPN">
+  <button type="button" class="advanced-head" aria-expanded={advancedOpen} aria-controls="vpn-advanced-body"
+    onclick={() => { advancedOpen = !advancedOpen; }}>
+    <svg class="chevron" class:open={advancedOpen} width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m6 4 4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
+    <span>Расширенные параметры VPN</span>
+  </button>
+  {#if advancedOpen}
+    <div id="vpn-advanced-body" transition:slide={{ duration: motionDuration, easing: cubicInOut }}>
+      <div class="advanced-body">
+        {#if inbound === "tun"}
+          <div class="line" transition:slide={{ duration: motionDuration, easing: cubicInOut }}>
+            <div class="text">
+              <span class="label">Другой способ обработки TUN</span>
+              <span class="hint">Для проверки проблем с подключением. Переключение перезапустит VPN.</span>
+            </div>
+            <Switch label="Другой способ обработки TUN" checked={!!store?.systemStack} disabled={!store || !!busy} onchange={(v) => set({ systemStack: v })} />
+          </div>
+        {/if}
+        <div class="links"><button type="button" class="link" onclick={() => api.openPath("vpnlog").catch(fail)}>Лог sing-box</button></div>
+        <section class="route-console" aria-labelledby="vpn-routes-title">
+          <div class="console-head">
+            <h2 id="vpn-routes-title">Фактические маршруты</h2>
+            <Button disabled={!running || readingRoutes || !!busy} onclick={readRoutes}>
+              <span class="refresh-label">Обновить снимок<span class="refresh-progress" role="status" aria-label={readingRoutes ? "Обновление маршрутов" : undefined}>{#if readingRoutes}<Spinner />{/if}</span></span>
+            </Button>
+          </div>
+          <p class="hint console-hint">Снимок активных соединений. «Напрямую» означает обход VPN; участие zapret этим не подтверждается.</p>
+          <!-- svelte-ignore a11y_no_noninteractive_tabindex (Keyboard users must be able to scroll the snapshot.) -->
+          <div class="console-body" role="region" aria-label="Снимок маршрутов" aria-busy={readingRoutes} tabindex="0">
+            {#if !running}<div class="console-empty">Включите VPN, чтобы посмотреть активные соединения.</div>{/if}
+            {#each routeRows as row, i (i)}
+              <div class="route-row" class:message={!row.route}>
+                {#if row.route}<span class="route-label" class:direct={row.route === "Напрямую"}>{row.route}</span>{/if}
+                <span class="route-text">{row.text}</span>
+              </div>
+            {:else}
+              {#if running}<div class="console-empty">{readingRoutes ? "Получение снимка…" : "Обновите снимок во время просмотра видео или подключения к голосу."}</div>{/if}
+            {/each}
+          </div>
+        </section>
+      </div>
+    </div>
+  {/if}
+</section>
+
 <style>
+  .mode-row { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  .mode-progress, .refresh-progress { display: inline-flex; align-items: center; justify-content: center; width: 18px; min-width: 18px; }
+  .refresh-label { display: inline-flex; align-items: center; gap: 6px; }
+  .advanced { overflow: hidden; }
+  .advanced-head { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 44px; padding: 10px 20px; border: none; background: transparent; color: var(--tx); font-size: 14px; font-weight: 600; text-align: left; }
+  .advanced-head:focus-visible { outline-offset: -3px; }
+  .chevron { flex-shrink: 0; transition: transform 180ms var(--theme-ease); }
+  .chevron.open { transform: rotate(90deg); }
+  .advanced-body { display: flex; flex-direction: column; gap: 16px; padding: 16px 20px 20px; border-top: 1px solid var(--line); }
+  .advanced-body .text { gap: 4px; }
+  .advanced-body .links { margin-top: 0; }
+  .route-console { min-width: 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; container-type: inline-size; }
+  .console-head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; padding: 12px 20px; }
+  .console-hint { padding: 0 20px 12px; }
+  .console-body { min-height: 160px; max-height: 320px; overflow: auto; padding: 8px 20px 14px; border-top: 1px solid var(--line); font: 12px/22px var(--font-mono); user-select: text; cursor: text; }
+  .route-row { display: grid; grid-template-columns: 100px minmax(0, 1fr); gap: 8px; }
+  .route-row.message { display: block; }
+  .route-label { color: var(--tx); }
+  .route-label.direct { color: var(--accent); }
+  .route-text { color: var(--tx2); overflow-wrap: anywhere; white-space: pre-wrap; }
+  .console-empty { color: var(--faint); overflow-wrap: anywhere; }
+  @container (max-width: 420px) {
+    .route-row { grid-template-columns: minmax(0, 1fr); gap: 0; margin-bottom: 8px; }
+  }
   .head-status {
     font-size: 12px;
     color: var(--faint);
@@ -542,6 +632,8 @@
   }
   .srv-meta {
     width: 110px;
+    flex-shrink: 0;
+    overflow-wrap: anywhere;
     text-align: right;
     font-size: 12px;
     color: var(--faint);
@@ -552,7 +644,8 @@
     line-height: 1;
   }
   .row2 {
-    display: flex;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr));
     gap: 16px;
     align-items: stretch;
   }
@@ -563,19 +656,6 @@
     display: flex;
     flex-direction: column;
     gap: 12px;
-  }
-  .opt {
-    display: flex;
-    align-items: flex-start;
-    gap: 10px;
-    cursor: pointer;
-  }
-  .opt input {
-    margin-top: 3px;
-    accent-color: var(--accent);
-  }
-  .opt .hint {
-    display: block;
   }
   .line {
     display: flex;
@@ -588,10 +668,5 @@
     display: flex;
     gap: 16px;
     flex-wrap: wrap;
-  }
-  @media (max-width: 860px) {
-    .row2 {
-      flex-direction: column;
-    }
   }
 </style>

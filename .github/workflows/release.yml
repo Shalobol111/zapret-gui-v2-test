@@ -24,6 +24,9 @@ jobs:
           workspaces: src-tauri
 
       - name: Check version matches tag
+        run: node scripts/check-version.mjs
+
+      - name: Verify release tag
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}".TrimStart("v")

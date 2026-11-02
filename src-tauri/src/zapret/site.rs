@@ -210,6 +210,8 @@ pub struct Item {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
+    AddToVpn,
+    OpenVpn,
     /// Добавить домен в «Свои домены».
     AddToList,
     /// Подобрать стратегию под сайт.
@@ -262,7 +264,7 @@ pub fn verdict(f: &Facts) -> (String, Level, Vec<Action>) {
                 f.code.unwrap_or(403)
             ),
             Level::Warn,
-            vec![],
+            vec![AddToVpn],
         );
     }
     if f.reachable {
@@ -542,6 +544,7 @@ mod tests {
 
         let geo = Facts { reachable: true, geo_blocked: true, code: Some(451), ..base.clone() };
         assert!(verdict(&geo).0.contains("451"));
+        assert_eq!(verdict(&geo).2, vec![Action::AddToVpn]);
         assert_eq!(verdict(&Facts { reachable: true, ..base.clone() }).1, Level::Ok);
         assert!(verdict(&Facts { no_host: true, ..base }).2.is_empty());
     }

@@ -5,7 +5,7 @@
   import Button from "./Button.svelte";
   import Spinner from "./Spinner.svelte";
   import * as api from "../lib/api";
-  import { offerRestart } from "../lib/restart";
+  import { offerRestart, offerVpnRestart } from "../lib/restart";
   import { app, go } from "../lib/state.svelte";
   import { askDialog, confirmDialog, toast } from "../lib/ui.svelte";
   import type { SiteAction, SiteProbe, SiteReport } from "../lib/types";
@@ -87,6 +87,16 @@
     busy = action;
     try {
       switch (action) {
+        case "add_to_vpn": {
+          const added = await api.siteAddVpn(report.domain);
+          if (added) offerVpnRestart(`${report.domain} добавлен в личный VPN-список`);
+          else toast("Домен уже есть в личном VPN-списке", "info");
+          report.actions = ["open_vpn", ...report.actions.filter((a) => a !== "add_to_vpn" && a !== "open_vpn")];
+          report.verdict = "Домен в VPN-списке. Включите или перезапустите VPN и проверьте сайт ещё раз.";
+          report.verdictLevel = "info";
+          break;
+        }
+        case "open_vpn": go("vpn"); break;
         case "add_to_list": {
           const added = await api.siteAdd(report.domain);
           if (added) offerRestart(`${report.domain} добавлен в «Свои домены»`);
@@ -135,6 +145,8 @@
   }
 
   const labels: Record<SiteAction, string> = {
+    add_to_vpn: "Добавить в VPN-список",
+    open_vpn: "Открыть VPN",
     add_to_list: "Добавить в Свои домены",
     pick: "Подобрать стратегию",
     enable_bypass: "Включить обход",
@@ -227,13 +239,15 @@
           {:else if pick.best}
             <span class="dot ok"></span>Сайт открывается со стратегией «{short(pick.best)}»
           {:else if !pick.cancelled}
-            <span class="dot err"></span>Ни одна стратегия не открыла сайт — возможно, его блокируют по IP: попробуйте
-            IPSet «Любой» на Главной.
+            <span class="dot err"></span>Ни одна стратегия не открыла сайт. Можно попробовать VPN.
           {/if}
         </p>
       {/if}
 
       <div class="actions">
+        {#if pick && !pick.running && !pick.best && !pick.cancelled && !report.actions.includes("add_to_vpn") && !report.actions.includes("open_vpn")}
+          <Button height={32} size={12} disabled={busy !== null} onclick={() => run("add_to_vpn")}>Добавить в VPN-список</Button>
+        {/if}
         {#if pick && !pick.running && pick.best}
           <Button height={32} size={12} disabled={!app.isAdmin} onclick={() => apply(pick.best!)}>Включить «{short(pick.best)}»</Button>
         {/if}

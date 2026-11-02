@@ -7,6 +7,7 @@
     label,
     height = 28,
     disabled = false,
+    animated = false,
     onchange,
   }: {
     options: { value: T; label: string }[];
@@ -14,11 +15,34 @@
     label: string;
     height?: 28 | 30;
     disabled?: boolean;
+    animated?: boolean;
     onchange: (v: T) => void;
   } = $props();
+  let track: HTMLDivElement;
+  let indicator = $state({ x: 0, width: 0 });
+  function measure() {
+    const selected = track?.querySelector<HTMLButtonElement>('[aria-pressed="true"]');
+    if (selected) indicator = { x: selected.offsetLeft, width: selected.offsetWidth };
+  }
+  $effect(() => {
+    if (!animated || !track) return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(track);
+    let mounted = true;
+    document.fonts.ready.then(() => { if (mounted) measure(); });
+    measure();
+    return () => { mounted = false; observer.disconnect(); };
+  });
+  $effect(() => {
+    void value;
+    if (!animated) return;
+    const frame = requestAnimationFrame(measure);
+    return () => cancelAnimationFrame(frame);
+  });
 </script>
 
-<div class="track" role="group" aria-label={label}>
+<div class="track" class:animated bind:this={track} role="group" aria-label={label}>
+  {#if animated}<span class="indicator" aria-hidden="true" style:width="{indicator.width}px" style:transform="translateX({indicator.x}px)"></span>{/if}
   {#each options as o (o.value)}
     <button
       type="button"
@@ -35,6 +59,7 @@
 
 <style>
   .track {
+    position: relative;
     display: flex;
     padding: 3px;
     gap: 2px;
@@ -44,6 +69,8 @@
     flex-shrink: 0;
   }
   .seg {
+    position: relative;
+    z-index: 1;
     border: none;
     border-radius: 7px;
     font-size: 12px;
@@ -56,6 +83,18 @@
     background: var(--segon);
     color: var(--tx);
     box-shadow: var(--segshadow);
+  }
+  .animated .seg.on { background: transparent; box-shadow: none; }
+  .indicator {
+    position: absolute;
+    left: 0;
+    top: 3px;
+    bottom: 3px;
+    border-radius: 7px;
+    background: var(--segon);
+    box-shadow: var(--segshadow);
+    pointer-events: none;
+    transition: transform 180ms var(--theme-ease), width 180ms var(--theme-ease);
   }
   .seg:disabled {
     cursor: default;

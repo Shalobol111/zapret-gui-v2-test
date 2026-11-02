@@ -3,8 +3,12 @@
 // Параметры URL: ?state=off|on|service|external  &admin=0  &path=none  &theme=dark|light
 
 import type { Cell, DiagItem, Fakes, ListInfo, LogEntry, LogLevel, Settings, Status, StrategyInfo, TestKind, TestRow, TestRun } from "./types";
+import generalVpnSeed from "../../src-tauri/data/list-vpn-general.txt?raw";
+import { version as appVersion } from "../../package.json";
 
 const params = new URLSearchParams(location.search);
+// Только браузерная проверка компоновки при увеличении интерфейса.
+if (params.get("zoom") === "150") document.documentElement.style.zoom = "1.5";
 const KEY = "zgui-mock-settings";
 
 const STRATEGIES: StrategyInfo[] = [
@@ -111,7 +115,7 @@ let vpnStore = {
   manual: [] as typeof VPN_SERVERS,
   selected: null as string | null,
   routeMode: (params.get("vpnmode") as "lists" | "all_except_ru") ?? "lists",
-  inbound: "proxy" as "proxy" | "tun",
+  inbound: (params.get("inbound") === "tun" ? "tun" : "proxy") as "proxy" | "tun",
   presets: ["blocked", "ai"],
   zapretDirect: true,
   port: 2080,
@@ -142,7 +146,7 @@ function releaseNotes() {
 
 /** ?au=available|current|error — обновление ZapretGUI. */
 function mockAppUpdate(au: string | null): Status["appUpdate"] {
-  const base = { state: "idle" as Status["appUpdate"]["state"], current: "2.0.0", latest: null as string | null, notes: null as string | null,
+  const base = { state: "idle" as Status["appUpdate"]["state"], current: appVersion, latest: null as string | null, notes: null as string | null,
     url: null as string | null, progress: null as number | null, error: null as string | null, portable: params.get("portable") === "1" };
   if (au === "available")
     return { ...base, state: "available", latest: "2.1.0", notes: releaseNotes(), url: "https://github.com/Shalobol111/zapret-gui-v2/releases/tag/v2.1.0" };
@@ -316,6 +320,9 @@ const LISTS: (ListInfo & { text: string; note: string | null })[] = [
   { id: "exclude", title: "Исключения", file: "list-exclude-user.txt", kind: "domains", note: null, text: "domain.example.abc\n" },
   { id: "ipset", title: "IPSet", file: "ipset-all.txt.backup", kind: "ips", note: "IPSet сейчас не в режиме «Загруженный» — редактируется сохранённый список, он вернётся при включении режима", text: "1.2.3.0/24\n5.6.7.8\n2001:db8::/32\n300.1.1.1\n" },
   { id: "ipset_exclude", title: "Исключения IP", file: "ipset-exclude-user.txt", kind: "ips", note: null, text: "203.0.113.113/32\n" },
+  { id: "vpn_general", title: "list-vpn-general", file: "list-vpn-general.txt", kind: "domains", note: "Общий список: заблокированные сайты, ИИ-сервисы, Instagram, Facebook, WhatsApp, X и TikTok. Используется в режиме «Списки → VPN»; сайты zapret и список «Всегда напрямую» имеют приоритет. Изменения сохраняются — файл не обновляется автоматически. После сохранения перезапустите VPN.", text: generalVpnSeed },
+  { id: "vpn_domains", title: "Через VPN", file: "vpn-domains.txt", kind: "domains", note: "Домены из этого списка идут через выбранный VPN-сервер в обоих режимах. По одному домену на строку, поддомены включаются автоматически. После сохранения перезапустите VPN.", text: "# Всегда через VPN\nchatgpt.com\nclaude.ai\n" },
+  { id: "vpn_direct", title: "Всегда напрямую", file: "direct-domains.txt", kind: "domains", note: "Домены из этого списка идут мимо VPN. Он имеет приоритет над списком «Через VPN». По одному домену на строку, поддомены включаются автоматически. После сохранения перезапустите VPN.", text: "# Всегда напрямую\nexample.com\n" },
 ];
 
 // ?big=1 — IPSet на 30 000 строк, как настоящий ipset-all.txt (проверка скорости редактора).
@@ -393,7 +400,7 @@ export async function call<T>(cmd: string, args: Record<string, unknown> = {}): 
           settings,
           isAdmin: status.isAdmin,
           systemTheme: matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark",
-          appVersion: "2.0.0",
+          appVersion,
           startHidden: false,
         };
       case "settings_set":
@@ -507,12 +514,13 @@ export async function call<T>(cmd: string, args: Record<string, unknown> = {}): 
         await wait(900);
         const d = String(args.input).replace(/^https?:\/\//, "").split("/")[0].replace(/^www\./, "").toLowerCase();
         const it = (id: string, title: string, level: DiagItem["level"], value: string, detail: string | null = null) => ({ id, title, level, value, detail });
-        if (d.includes("chatgpt"))
-          return { domain: d, reachable: true, actions: [], verdictLevel: "warn",
+        if (d.includes("chatgpt") || d === "geoblocked.example")
+          return { domain: d, reachable: true, actions: [d.includes("chatgpt") ? "open_vpn" : "add_to_vpn"], verdictLevel: "warn",
             verdict: "Сайт отвечает, но не пускает (код 403). Скорее всего, он сам ограничивает доступ из вашей страны — zapret тут не поможет.",
             items: [it("lists", "Списки zapret", "warn", "нет", "Домена нет ни в одном списке"), it("dns", "DNS", "ok", "ок", "104.18.32.47, 172.64.155.209"),
               it("ipset", "IPSet", "info", "любой IP", "Режим «Любой» — фильтр по IP охватывает все адреса"), it("access", "Доступ с обходом", "ok", "открывается", "TLS 1.2: OK · TLS 1.3: OK"),
-              it("answer", "Ответ сайта", "warn", "код 403", "Сайт отказывает в доступе — обычно это ограничение по стране")] };
+              it("answer", "Ответ сайта", "warn", "код 403", "Сайт отказывает в доступе — обычно это ограничение по стране"),
+              it("vpn", "Правило VPN", "info", d.includes("chatgpt") ? "через VPN · выключен" : "напрямую", "По текущим настройкам; фактическое соединение смотрите в разделе VPN.")] };
         if (d.includes("discord"))
           return { domain: d, reachable: true, actions: [], verdictLevel: "ok", verdict: "Сайт открывается.",
             items: [it("lists", "Списки zapret", "ok", "есть", "list-general.txt: «discord.com»"), it("dns", "DNS", "ok", "ок", "162.159.138.232"),
@@ -522,6 +530,9 @@ export async function call<T>(cmd: string, args: Record<string, unknown> = {}): 
           items: [it("lists", "Списки zapret", "warn", "нет", "Домена нет ни в одном списке — стратегии его не обрабатывают"), it("dns", "DNS", "ok", "ок", "172.67.182.196, 104.21.32.39"),
             it("ipset", "IPSet", "info", "любой IP", "Режим «Любой» — фильтр по IP охватывает все адреса"), it("access", "Доступ с обходом", "err", "не открывается", "TLS 1.2: ERROR · TLS 1.3: ERROR")] };
       }
+      case "site_add_vpn":
+        await wait(300);
+        return true;
       case "site_add":
         await wait(300);
         log("ok", `${args.domain} добавлен в «Свои домены»`);
@@ -540,18 +551,25 @@ export async function call<T>(cmd: string, args: Record<string, unknown> = {}): 
         return testRun;
       case "diag_run":
         await wait(700);
-        return DIAG;
+        return [...DIAG, { id: "vpn-state", title: "Подключение VPN", level: status.vpn.running && status.vpn.ready ? "ok" : "info", value: status.vpn.running ? "готово" : "выключено", detail: "Готовность процесса и порта не подтверждает доступность всех сайтов.", fix: null, fixLabel: null, fixSafe: false }];
       case "lists_index":
-        return LISTS.map(({ text: _t, note: _n, ...info }) => info);
+        return LISTS.filter((l) => status.zapret.valid || l.id.startsWith("vpn_")).map(({ text: _t, note: _n, ...info }) => info);
       case "list_read": {
         const l = LISTS.find((x) => x.id === args.id)!;
-        return { ...l, hash: String(l.text.length), crlf: true };
+        return { ...l, hash: String(l.text.length), crlf: !l.id.startsWith("vpn_") };
       }
       case "list_save": {
         const l = LISTS.find((x) => x.id === args.id)!;
-        l.text = String(args.text).endsWith("\n") ? String(args.text) : `${args.text}\n`;
+        if (!args.force && String(args.baseHash) !== String(l.text.length)) throw "conflict";
+        if (l.id.startsWith("vpn_")) {
+          for (const [i, line] of String(args.text).split("\n").entries()) {
+            const value = line.split("#")[0].trim();
+            if (value && !/^\^?\.?[a-z0-9_-]+(?:\.[a-z0-9_-]+)*$/i.test(value)) throw `Строка ${i + 1}: укажите домен без протокола, пути и порта, например example.com`;
+          }
+        }
+        l.text = !String(args.text) || String(args.text).endsWith("\n") ? String(args.text) : `${args.text}\n`;
         log("ok", `Сохранён список ${l.file}`);
-        return { ...l, hash: String(l.text.length), crlf: true };
+        return { ...l, hash: String(l.text.length), crlf: !l.id.startsWith("vpn_") };
       }
       case "update_check":
         await wait(600);
@@ -712,8 +730,27 @@ export async function call<T>(cmd: string, args: Record<string, unknown> = {}): 
         vpnStore.selected = (args.id as string | null) ?? null;
         return vpnView();
       case "vpn_set":
+        await wait(Math.min(10000, Math.max(100, Number(params.get("vpndelay")) || 900)));
+        if (params.get("vpnfail") === "save") throw new Error("Не удалось сохранить настройки VPN (проверка интерфейса)");
         vpnStore = { ...vpnStore, ...(args.patch as object) };
+        if (params.get("vpnfail") === "start") {
+          status.vpn = { ...status.vpn, running: false, ready: false, error: "Не удалось подключить VPN (проверка интерфейса)" };
+          changed();
+          throw new Error("Не удалось подключить VPN (проверка интерфейса)");
+        }
+        status.vpn = { ...status.vpn, inbound: status.vpn.running ? vpnStore.inbound : null };
+        changed();
         return vpnView();
+      case "vpn_routes":
+        await wait(700);
+        if (params.get("routes") === "error") throw new Error("Не удалось получить маршруты (проверка интерфейса)");
+        if (params.get("routes") === "empty") return "Активных соединений нет. Откройте видео или подключитесь к голосу и обновите снимок.";
+        return [
+          "Напрямую | rr3---sn-4g5ednsl.googlevideo.com:443 | IP 142.250.184.14 | udp | chrome.exe | ↑24680 ↓23872801 байт",
+          "VPN | chatgpt.com:443 | IP 104.18.32.7 | tcp | ChatGPT.exe | ↑8340 ↓154220 байт",
+          "Напрямую | discord.com:443 | IP 162.159.138.232 | tcp | Discord.exe | ↑12390 ↓26348 байт",
+          "Напрямую | very-long-hostname-for-testing-line-wrapping.example.net:443 | IP 2606:4700:7::a29f:89ea | tcp | Discord.exe | ↑2888 ↓1381 байт",
+        ].join("\n");
       case "vpn_start":
         requireAdmin();
         status.vpn = { ...status.vpn, running: true, ready: false, error: null, startedAt: Date.now(), inbound: vpnStore.inbound, routeMode: vpnStore.routeMode,

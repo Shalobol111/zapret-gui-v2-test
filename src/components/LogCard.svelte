@@ -23,8 +23,7 @@
     <span class="grow"></span>
     <span class="hint">{collapsed ? "Развернуть" : "Свернуть"}</span>
   </button>
-  {#if !collapsed}
-    <div class="body">
+    <div class="body" inert={collapsed} aria-hidden={collapsed}>
       {#each rows as e (e.id)}
         <div class="row">
           <span class="time">{e.time}</span>
@@ -35,13 +34,15 @@
         <div class="empty">Пока пусто</div>
       {/each}
     </div>
-  {/if}
 </section>
 
 <style>
   .card {
     flex-grow: 1;
-    min-height: 0;
+    flex-basis: 46px;
+    flex-shrink: 0;
+    min-height: 46px;
+    transition: flex-grow 180ms var(--theme-ease);
     display: flex;
     flex-direction: column;
     border-radius: 16px;
@@ -100,7 +101,10 @@
     line-height: 22px;
     user-select: text;
     cursor: text;
+    opacity: 1;
+    transition: opacity 180ms var(--theme-ease);
   }
+  .collapsed .body { opacity: 0; pointer-events: none; }
   .row {
     display: grid;
     grid-template-columns: 72px 44px 1fr;

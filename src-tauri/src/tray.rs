@@ -66,6 +66,18 @@ fn build_menu(app: &AppHandle, s: &Status, current: Option<&str>) -> tauri::Resu
     let refs: Vec<&dyn tauri::menu::IsMenuItem<Wry>> =
         items.iter().map(|i| i as &dyn tauri::menu::IsMenuItem<Wry>).collect();
     let strategies = Submenu::with_items(app, "Стратегия", !items.is_empty(), &refs)?;
+    let vpn_open = MenuItem::with_id(app, "vpn-open", "Открыть VPN", true, None::<&str>)?;
+    let vpn_can = s.is_admin
+        && s.vpn.busy.is_none()
+        && !s.tests_running
+        && (s.vpn.running || (s.vpn.installed && s.vpn.xray_installed && s.vpn.servers > 0));
+    let vpn_toggle = MenuItem::with_id(
+        app,
+        "vpn-toggle",
+        if s.vpn.running { "Выключить VPN" } else { "Включить VPN" },
+        vpn_can,
+        None::<&str>,
+    )?;
     let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
     Menu::with_items(
         app,
@@ -74,6 +86,9 @@ fn build_menu(app: &AppHandle, s: &Status, current: Option<&str>) -> tauri::Resu
             &PredefinedMenuItem::separator(app)?,
             &toggle,
             &strategies,
+            &PredefinedMenuItem::separator(app)?,
+            &vpn_toggle,
+            &vpn_open,
             &PredefinedMenuItem::separator(app)?,
             &quit,
         ],
@@ -87,14 +102,23 @@ pub fn update(app: &AppHandle, s: &Status) {
     let last_strategy = app.state::<AppState>().settings.lock().unwrap().get().last_strategy.clone();
     let current = s.bypass.strategy.clone().or(s.service.strategy.clone()).or(last_strategy);
 
-    let tooltip = match (&s.bypass.state, &s.bypass.strategy) {
+    let mut tooltip = match (&s.bypass.state, &s.bypass.strategy) {
         (BypassState::On, Some(name)) => format!("ZapretGUI — обход включён · {name}"),
         (BypassState::On, None) => "ZapretGUI — обход включён".into(),
         (BypassState::Starting, _) => "ZapretGUI — запуск…".into(),
         (BypassState::Stopping, _) => "ZapretGUI — остановка…".into(),
         (BypassState::Off, _) => "ZapretGUI — обход выключен".into(),
     };
-    let key = format!(
+    tooltip.push_str(if s.vpn.busy.is_some() {
+        "\nVPN — переключение…"
+    } else if s.vpn.running && s.vpn.ready {
+        "\nVPN включён"
+    } else if s.vpn.running {
+        "\nVPN — подключение не готово"
+    } else {
+        "\nVPN выключен"
+    });
+    let mut key = format!(
         "{on}|{:?}|{current:?}|{:?}|{}|{}|{}",
         s.bypass.state,
         s.service.state,
@@ -102,13 +126,17 @@ pub fn update(app: &AppHandle, s: &Status) {
         s.is_admin && s.zapret.valid,
         s.zapret.strategies.iter().map(|x| x.name.as_str()).collect::<Vec<_>>().join(";")
     );
+    key.push_str(&format!(
+        "|{}|{}|{:?}|{}|{}|{}",
+        s.vpn.running, s.vpn.ready, s.vpn.busy, s.vpn.installed, s.vpn.xray_installed, s.vpn.servers
+    ));
     let mut last = LAST.lock().unwrap();
     if last.as_deref() == Some(key.as_str()) {
         return;
     }
     *last = Some(key);
     let _ = tray.set_tooltip(Some(tooltip));
-    if let Ok(icon) = Image::from_bytes(if on { ICON_ON } else { ICON_OFF }) {
+    if let Ok(icon) = Image::from_bytes(if on || (s.vpn.running && s.vpn.ready) { ICON_ON } else { ICON_OFF }) {
         let _ = tray.set_icon(Some(icon));
     }
     if let Ok(menu) = build_menu(app, s, current.as_deref()) {
@@ -126,6 +154,26 @@ fn on_menu(app: &AppHandle, id: &str) {
             }
         }
         "toggle" => spawn(app, None),
+        "vpn-open" => {
+            show_main(app);
+            let _ = app.emit("nav://goto", "vpn");
+        }
+        "vpn-toggle" => {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let running = app.state::<AppState>().vpn.lock().unwrap().child.is_some();
+                let result = if running {
+                    crate::commands::vpn_stop(app.clone()).await
+                } else {
+                    crate::commands::vpn_start(app.clone()).await
+                };
+                if let Err(e) = result {
+                    journal::err(format!("Трей VPN: {e}"));
+                    show_main(&app);
+                    let _ = app.emit("nav://goto", "vpn");
+                }
+            });
+        }
         other => {
             if let Some(name) = other.strip_prefix("strategy:") {
                 spawn(app, Some(name.to_string()));

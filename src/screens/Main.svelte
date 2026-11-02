@@ -1,6 +1,7 @@
 <script lang="ts">
   import Button from "../components/Button.svelte";
   import LogCard from "../components/LogCard.svelte";
+  import VpnSummary from "../components/VpnSummary.svelte";
   import PageHeader from "../components/PageHeader.svelte";
   import PowerButton from "../components/PowerButton.svelte";
   import Segmented from "../components/Segmented.svelte";
@@ -351,6 +352,7 @@
   </section>
 </div>
 
+<VpnSummary />
 <LogCard />
 
 <style>

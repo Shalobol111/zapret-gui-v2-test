@@ -2,6 +2,7 @@
 //! свои списки «всегда через VPN» / «всегда напрямую» и домены из списков zapret.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -160,6 +161,7 @@ pub fn domains(p: &Preset) -> Vec<String> {
     out
 }
 
+#[cfg(test)]
 pub fn preset(id: &str) -> Option<&'static Preset> {
     PRESETS.iter().find(|p| p.id == id)
 }
@@ -172,6 +174,42 @@ pub fn infos() -> Vec<PresetInfo> {
 
 pub const VPN_FILE: &str = "vpn-domains.txt";
 pub const DIRECT_FILE: &str = "direct-domains.txt";
+pub const GENERAL_FILE: &str = "list-vpn-general.txt";
+
+fn initial_general(extra: impl IntoIterator<Item = String>) -> String {
+    let mut domains: Vec<String> = parse(include_str!("../../data/list-vpn-general.txt"))
+        .into_iter()
+        .chain(extra)
+        .map(|s| s.trim_start_matches('.').to_lowercase())
+        .filter(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_')))
+        .collect();
+    domains.sort();
+    domains.dedup();
+    format!("# Основной список VPN: заблокированные сайты, ИИ, Meta, X, TikTok.\n# Источник начального списка: https://github.com/itdoginfo/allow-domains\n# По одному домену на строку. Поддомены включаются автоматически.\n# Ваши изменения не перезаписываются при запуске приложения.\n\n{}\n", domains.join("\n"))
+}
+
+/// Однократное создание из встроенного списка и кэша всех пяти наборов.
+/// Даже намеренно пустой существующий файл не заполняем повторно.
+pub fn ensure_general() -> Result<(), String> {
+    let path = custom_path(GENERAL_FILE);
+    if path.try_exists().map_err(|e| e.to_string())? {
+        return Ok(());
+    }
+    fs::create_dir_all(super::dir()).map_err(|e| e.to_string())?;
+    let text = initial_general(PRESETS.iter().flat_map(domains));
+    match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            if let Err(e) = file.write_all(text.as_bytes()) {
+                drop(file);
+                let _ = fs::remove_file(&path);
+                return Err(format!("Не удалось создать {GENERAL_FILE}: {e}"));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(format!("Не удалось создать {GENERAL_FILE}: {e}")),
+    }
+}
 
 pub fn custom_path(name: &str) -> PathBuf {
     super::dir().join(name)
@@ -194,6 +232,35 @@ pub fn custom(name: &str) -> Vec<String> {
     fs::read_to_string(custom_path(name)).map(|t| parse(&t)).unwrap_or_default()
 }
 
+pub fn matches(domains: &[String], domain: &str) -> bool {
+    domains.iter().any(|s| {
+        let suffix = s.trim_start_matches('.');
+        domain == suffix || domain.strip_suffix(suffix).is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+/// Явное добавление в личный список имеет приоритет над общим списком и списками zapret.
+pub fn add_site(domain: &str) -> Result<bool, String> {
+    if matches(&custom(DIRECT_FILE), domain) {
+        return Err("Домен входит в «Всегда напрямую». Сначала измените этот список в разделе «Списки → VPN»".into());
+    }
+    let data = crate::zapret::userlists::read(&super::dir(), "vpn_domains")?;
+    if matches(&parse(&data.text), domain) {
+        return Ok(false);
+    }
+    let text = format!(
+        "{}{}{}\n",
+        data.text,
+        if data.text.is_empty() || data.text.ends_with('\n') { "" } else { "\n" },
+        domain
+    );
+    crate::zapret::userlists::save(&super::dir(), "vpn_domains", &text, &data.hash, false).map_err(|e| match e {
+        crate::zapret::userlists::SaveError::Conflict => "VPN-список изменился — повторите добавление".into(),
+        crate::zapret::userlists::SaveError::Other(e) => e,
+    })?;
+    Ok(true)
+}
+
 /// Домены, которые обходит zapret (его списки) — им место напрямую, через zapret.
 pub fn zapret_domains(root: Option<&Path>) -> Vec<String> {
     let Some(root) = root else { return vec![] };
@@ -211,6 +278,69 @@ pub fn zapret_domains(root: Option<&Path>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matches_domains_at_label_boundaries() {
+        let domains = vec!["example.com".into(), ".xn--p1ai".into()];
+        for domain in ["example.com", "a.example.com", "a.b.example.com", "site.xn--p1ai"] {
+            assert!(matches(&domains, domain));
+        }
+        for domain in ["badexample.com", "example.com.bad", "example.org"] {
+            assert!(!matches(&domains, domain));
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn isolated_add_site_preserves_direct_priority_and_deduplicates() {
+        assert!(std::env::var_os("ZAPRETGUI_DATA_DIR").is_some());
+        ensure_custom();
+        fs::write(custom_path(DIRECT_FILE), "direct.example\n").unwrap();
+        fs::write(custom_path(VPN_FILE), "# Keep this comment\nexisting.example\n").unwrap();
+        assert!(add_site("a.direct.example").is_err());
+        assert!(!add_site("a.existing.example").unwrap());
+        assert!(add_site("new.example").unwrap());
+        let saved = fs::read_to_string(custom_path(VPN_FILE)).unwrap();
+        assert!(saved.contains("# Keep this comment"));
+        assert!(saved.contains("existing.example"));
+        assert!(saved.contains("new.example"));
+        assert!(!add_site("new.example").unwrap());
+    }
+
+    #[test]
+    fn general_seed_covers_every_category_and_deduplicates() {
+        let text = initial_general(vec![".CHATGPT.COM".into(), "only-in-cache.example".into()]);
+        let entries = parse(&text);
+        assert!(entries.len() > 1100);
+        for domain in [
+            "4pda.to",
+            "chatgpt.com",
+            "claude.ai",
+            "facebook.com",
+            "instagram.com",
+            "whatsapp.com",
+            "twitter.com",
+            "tiktok.com",
+            "only-in-cache.example",
+        ] {
+            assert!(entries.iter().any(|d| d == domain), "Missing {domain}");
+        }
+        assert_eq!(entries.iter().filter(|d| d.as_str() == "chatgpt.com").count(), 1);
+    }
+
+    #[test]
+    #[ignore]
+    fn isolated_general_preserves_edits_and_empty_file() {
+        assert!(std::env::var_os("ZAPRETGUI_DATA_DIR").is_some());
+        ensure_general().unwrap();
+        assert!(custom(GENERAL_FILE).len() > 1100);
+        fs::write(custom_path(GENERAL_FILE), "my.example\n").unwrap();
+        ensure_general().unwrap();
+        assert_eq!(custom(GENERAL_FILE), vec!["my.example"]);
+        fs::write(custom_path(GENERAL_FILE), "").unwrap();
+        ensure_general().unwrap();
+        assert!(fs::read(custom_path(GENERAL_FILE)).unwrap().is_empty());
+    }
 
     #[test]
     fn parses_list_lines() {

@@ -18,4 +18,5 @@
       transform: rotate(360deg);
     }
   }
+  @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
 </style>

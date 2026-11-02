@@ -71,4 +71,7 @@
   main.scroll {
     overflow: auto;
   }
+  main:first-of-type {
+    overflow-y: auto;
+  }
 </style>

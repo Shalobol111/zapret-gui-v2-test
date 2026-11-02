@@ -68,6 +68,16 @@ pub fn build(i: &Input) -> Value {
         rules.push(json!({ "process_name": ["xray.exe"], "outbound": "direct" }));
     }
     rules.push(json!({ "ip_is_private": true, "outbound": "direct" }));
+    // Голос приходит на IP, а reverse_mapping может приписать общий IP чужому домену.
+    // При передаче Discord zapret выбираем UDP по процессу раньше доменных списков.
+    if i.inbound == Inbound::Tun
+        && i.zapret_direct.iter().any(|d| matches!(d.trim_start_matches('.'), "discord.com" | "discord.media"))
+    {
+        rules.push(json!({
+            "process_name": ["Discord.exe", "DiscordPTB.exe", "DiscordCanary.exe", "DiscordDevelopment.exe"],
+            "network": "udp", "outbound": "direct"
+        }));
+    }
     let mut sets = Vec::new();
     let mut add = |tag: &str, domains: &[String], outbound: &str, rules: &mut Vec<Value>| {
         if !domains.is_empty() {
@@ -94,38 +104,24 @@ pub fn build(i: &Input) -> Value {
             vec![json!({ "type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": i.port })]
         }
         Inbound::Tun => vec![json!({
-            "type": "tun", "tag": "tun-in", "interface_name": "ZapretGUI",
+            "type": "tun", "tag": "tun-in", "interface_name": super::tun::NAME,
             "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
             "auto_route": true, "strict_route": true, "stack": "mixed",
         })],
     };
 
     // DNS: сайты, идущие через VPN, резолвятся через VPN (DoH 1.1.1.1), остальное — системным DNS.
-    let (dns_rules, dns_final) = match i.route_mode {
-        RouteMode::Lists => {
-            let vpn_sets: Vec<Value> = sets
-                .iter()
-                .filter(|s| s["tag"] == "vpn-presets" || s["tag"] == "vpn-custom")
-                .map(|s| s["tag"].clone())
-                .collect();
-            let rules =
-                if vpn_sets.is_empty() { vec![] } else { vec![json!({ "rule_set": vpn_sets, "server": "remote" })] };
-            (rules, "local")
-        }
-        RouteMode::AllExceptRu => {
-            let direct_sets: Vec<Value> = sets
-                .iter()
-                .filter(|s| s["tag"] == "ru-direct" || s["tag"] == "direct-custom" || s["tag"] == "zapret")
-                .map(|s| s["tag"].clone())
-                .collect();
-            let rules = if direct_sets.is_empty() {
-                vec![]
-            } else {
-                vec![json!({ "rule_set": direct_sets, "server": "local" })]
-            };
-            (rules, "remote")
-        }
-    };
+    // Тот же порядок, что у маршрутов: своё direct → своё VPN → zapret → наборы.
+    // Объединение наборов меняет приоритет при пересечении доменов.
+    let dns_rules: Vec<Value> = rules
+        .iter()
+        .filter_map(|rule| {
+            let tag = rule.get("rule_set")?;
+            let server = if rule["outbound"] == "proxy" { "remote" } else { "local" };
+            Some(json!({ "rule_set": tag, "server": server }))
+        })
+        .collect();
+    let dns_final = if i.route_mode == RouteMode::Lists { "local" } else { "remote" };
 
     json!({
         "log": { "level": "warn", "timestamp": true, "output": i.log_file },
@@ -136,6 +132,7 @@ pub fn build(i: &Input) -> Value {
             ],
             "rules": dns_rules,
             "final": dns_final,
+            "reverse_mapping": i.inbound == Inbound::Tun,
         },
         "inbounds": inbounds,
         "outbounds": outbounds,
@@ -200,6 +197,57 @@ mod tests {
         i.inbound = Inbound::Tun;
         let c = build(&i);
         assert_eq!(c["inbounds"][0]["type"], "tun");
+        assert_eq!(c["dns"]["reverse_mapping"], true);
         assert!(c["route"]["rules"].as_array().unwrap().iter().any(|r| r["action"] == "hijack-dns"));
+    }
+
+    #[test]
+    fn discord_voice_direct_precedes_domain_rules_only_when_managed_by_zapret() {
+        for mode in [RouteMode::Lists, RouteMode::AllExceptRu] {
+            let mut i = input(mode);
+            i.inbound = Inbound::Tun;
+            i.zapret_direct.push("discord.com".into());
+            let c = build(&i);
+            let rules = c["route"]["rules"].as_array().unwrap();
+            let voice = rules.iter().position(|r| r["process_name"][0] == "Discord.exe").unwrap();
+            let domains = rules.iter().position(|r| r.get("rule_set").is_some()).unwrap();
+            assert!(voice < domains);
+            assert_eq!(rules[voice]["network"], "udp");
+            assert_eq!(rules[voice]["outbound"], "direct");
+            i.zapret_direct.clear();
+            assert!(!build(&i)["route"]["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["process_name"][0] == "Discord.exe"));
+            i.zapret_direct.push("discord.com".into());
+            i.inbound = Inbound::Proxy;
+            assert!(!build(&i)["route"]["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["process_name"][0] == "Discord.exe"));
+        }
+    }
+
+    #[test]
+    fn dns_keeps_route_priority_for_overlapping_domains() {
+        for mode in [RouteMode::Lists, RouteMode::AllExceptRu] {
+            let mut i = input(mode);
+            // Каждый список пересекается с остальными: порядок определяет маршрут и DNS.
+            i.direct_custom = vec!["shared.example".into()];
+            i.vpn_custom = i.direct_custom.clone();
+            i.zapret_direct = i.direct_custom.clone();
+            i.vpn_presets = i.direct_custom.clone();
+            i.ru_direct = i.direct_custom.clone();
+            let c = build(&i);
+            let dns = c["dns"]["rules"].as_array().unwrap();
+            let tags: Vec<&str> = dns.iter().map(|r| r["rule_set"].as_str().unwrap()).collect();
+            let last = if mode == RouteMode::Lists { "vpn-presets" } else { "ru-direct" };
+            assert_eq!(tags, vec!["direct-custom", "vpn-custom", "zapret", last]);
+            assert_eq!(dns[0]["server"], "local");
+            assert_eq!(dns[1]["server"], "remote");
+            assert_eq!(dns[2]["server"], "local");
+        }
     }
 }

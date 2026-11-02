@@ -5,6 +5,24 @@ import * as api from "./api";
 import { app } from "./state.svelte";
 import { toast } from "./ui.svelte";
 
+export function offerVpnRestart(what: string) {
+  if (!app.status?.vpn.running) {
+    toast(`${what} — изменения вступят в силу при включении VPN`, "ok");
+    return;
+  }
+  let applying = false;
+  toast(`${what} — перезапустите VPN, чтобы применить изменения`, "ok", {
+    label: "Перезапустить VPN",
+    run: async () => {
+      if (applying) return;
+      applying = true;
+      try { await api.vpnStart(); }
+      catch (e) { toast(api.errorText(e), "err"); }
+      finally { applying = false; }
+    },
+  });
+}
+
 /** `reinstall` — изменились аргументы winws (фейки, порты), а не содержимое списков. */
 export function offerRestart(what: string, reinstall = false) {
   const b = app.status?.bypass;

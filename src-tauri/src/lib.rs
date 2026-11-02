@@ -146,15 +146,6 @@ fn startup(app: &AppHandle) {
     }
     // VPN: убрать остатки прошлого сеанса (системный прокси на неработающий sing-box), затем автозапуск.
     vpn::recover();
-    let vpn_store = vpn::load();
-    if (vpn_store.autostart || settings.resume_vpn) && vpn::singbox::installed() && st.is_admin {
-        if settings.resume_vpn {
-            let _ = st.settings.lock().unwrap().patch(&json!({ "resumeVpn": false }));
-        }
-        if let Err(e) = vpn::start(&st) {
-            journal::warn(format!("VPN не включён при запуске: {e}"));
-        }
-    }
     // После обновления ZapretGUI — включить ручной обход, который работал до перезапуска.
     if let Some(name) = settings.resume_bypass.clone() {
         let _ = st.settings.lock().unwrap().patch(&json!({ "resumeBypass": null }));
@@ -163,6 +154,16 @@ fn startup(app: &AppHandle) {
         }
     } else if settings.start_bypass_on_launch && st.is_admin && info.valid {
         start_bypass_on_launch(&st, &info, settings.last_strategy.as_deref());
+    }
+    // Сначала zapret, затем TUN: одинаковая последовательность при входе в Windows и после обновления.
+    let vpn_store = vpn::load();
+    if (vpn_store.autostart || settings.resume_vpn) && vpn::singbox::installed() && st.is_admin {
+        if settings.resume_vpn {
+            let _ = st.settings.lock().unwrap().patch(&json!({ "resumeVpn": false }));
+        }
+        if let Err(e) = tauri::async_runtime::block_on(commands::vpn_start(app.clone())) {
+            journal::warn(format!("VPN не включён при запуске: {e}"));
+        }
     }
     start_app_update_checks(app);
     // Автозапуск: обновляем задачу, если программу перенесли в другую папку.
@@ -239,6 +240,7 @@ pub fn run() {
                 startup(&bg);
                 monitor::start(bg.clone());
                 autopilot::start(bg.clone());
+                vpn::voice::start(bg.clone());
                 // Окно показывает интерфейс после первой отрисовки. Страховка на случай сбоя:
                 std::thread::sleep(Duration::from_secs(4));
                 if let Some(w) = bg.get_webview_window("main") {
@@ -277,6 +279,7 @@ pub fn run() {
             commands::notify_test,
             commands::site_check,
             commands::site_add,
+            commands::site_add_vpn,
             commands::site_compare,
             commands::tests_site,
             commands::discord_info,
@@ -304,6 +307,7 @@ pub fn run() {
             commands::vpn_start,
             commands::vpn_stop,
             commands::vpn_ping,
+            commands::vpn_routes,
             commands::tests_cancel,
             commands::tests_last,
             commands::diag_run,
